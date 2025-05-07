@@ -1,0 +1,36 @@
+services:
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    volumes:
+      - ./ollama_data:/root/.ollama
+    restart: always
+    environment:
+      - OLLAMA_HOST="0.0.0.0"
+      - OLLAMA_FLASH_ATTENTION=1
+    networks:
+      - ollama-proxy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # alternatively, use `count: all` for all GPUs
+              capabilities: [gpu]
+
+  python_proxy:
+    image: localhost:5000/ollama_think_proxy:latest
+    ports:
+      - 11434:11434
+    environment:
+      OLLAMA_HOST: http://ollama:11434 
+    volumes:
+      - ~/logs:/logs
+    restart: always
+    networks:
+      - ollama-proxy
+    depends_on:
+      - ollama
+
+networks:
+  ollama-proxy:

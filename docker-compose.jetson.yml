@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  ollama:
+    image: dustynv/ollama:0.6.8-r36.4
+    container_name: ollama
+    tty: true
+    volumes:
+      - /home/dwu/.ollama/models:/data/models/ollama/models
+    restart: unless-stopped
+    environment:
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE=q8_0
+      - OLLAMA_HOST=0.0.0.0
+    networks:
+      - ollama-proxy
+
+  python_proxy:
+    image: localhost:5000/ollama_think_proxy:latest
+    ports:
+      - 11434:11434
+    environment:
+      OLLAMA_HOST: http://ollama:11434 
+    volumes:
+      - ~/logs:/logs
+    restart: always
+    networks:
+      - ollama-proxy
+    depends_on:
+      - ollama
+
+networks:
+  ollama-proxy:
