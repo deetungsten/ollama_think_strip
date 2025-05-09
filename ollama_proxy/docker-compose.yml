@@ -18,14 +18,14 @@ services:
               count: all # alternatively, use `count: all` for all GPUs
               capabilities: [gpu]
 
-  python_proxy:
-    image: localhost:5000/ollama_think_proxy:latest
+  nginx:
+    image: openresty/openresty:jammy
+    container_name: nginx_ollama_proxy
     ports:
       - 11434:11434
-    environment:
-      OLLAMA_HOST: http://ollama:11434 
     volumes:
-      - ~/logs:/logs
+      - ~/nginx/ollama_proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      - ~/nginx/logs:/var/log/nginx
     restart: always
     networks:
       - ollama-proxy
