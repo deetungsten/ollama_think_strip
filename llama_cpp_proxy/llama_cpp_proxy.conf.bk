@@ -1,0 +1,160 @@
+log_format api_logger escape=none '{"request_body": $request_body, '
+                                  '"response_body": $resp_body}';
+
+lua_need_request_body on;
+
+server {
+    listen 11434;  # Standard Ollama port
+
+    # Debugging logs
+    access_log /var/log/nginx/api_access.log api_logger;
+    error_log /var/log/nginx/error.log debug;
+
+    location / {
+        # Set headers for proxying to Llama.cpp server
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        
+        # Rewrite logic for API translation
+        set $llamacpp_url "http://llamacpp:8080";  # Adjust to your Llama.cpp server address
+        set $resp_body "";
+
+        access_by_lua_block {
+            local cjson = require("cjson")
+            local body = ngx.req.get_body_data()
+            
+            -- Only process POST requests
+            if ngx.req.get_method() == "POST" then
+                local uri = ngx.var.uri
+                
+                -- Handle Ollama API endpoints
+                if uri == "/api/generate" then
+                    -- Parse the Ollama request
+                    local success, ollama_request = pcall(cjson.decode, body)
+                    if not success then
+                        ngx.log(ngx.ERR, "Failed to parse Ollama request: ", body)
+                        ngx.exit(400)
+                    end
+                    
+                    -- Create Llama.cpp compatible request
+                    local llama_request = {
+                        prompt = ollama_request.prompt,
+                        temperature = ollama_request.temperature or 0.8,
+                        n_predict = ollama_request.num_predict or 128,
+                        stop = ollama_request.stop or {},
+                        stream = true  -- Always stream for compatibility
+                    }
+                    
+                    -- Additional parameters if present
+                    if ollama_request.top_p then llama_request.top_p = ollama_request.top_p end
+                    if ollama_request.top_k then llama_request.top_k = ollama_request.top_k end
+                    
+                    -- Set the request body for Llama.cpp
+                    ngx.req.set_body_data(cjson.encode(llama_request))
+                    
+                    -- Set the proxy URL to Llama.cpp completion endpoint
+                    ngx.var.llamacpp_url = "http://llamacpp:8080/completion"
+                end
+                
+                -- Handle model list endpoint
+                if uri == "/api/tags" then
+                    -- We'll create a simple passthrough that returns available models
+                    ngx.var.llamacpp_url = "http://llamacpp:8080/models"
+                end
+            end
+        }
+        
+        # Proxy to Llama.cpp server
+        proxy_pass $llamacpp_url;
+        
+        # Handle the response from Llama.cpp and transform it to Ollama format
+        header_filter_by_lua_block {
+            ngx.header.content_type = "application/json"
+        }
+        
+        body_filter_by_lua_block {
+            local chunk = ngx.arg[1]
+            local eof = ngx.arg[2]
+            local cjson = require("cjson")
+            
+            -- Buffer all chunks
+            ngx.ctx.buffered = (ngx.ctx.buffered or "") .. (chunk or "")
+            
+            if not eof then
+                -- For streaming responses
+                if chunk and chunk ~= "" then
+                    local success, llama_chunk = pcall(cjson.decode, chunk)
+                    if success then
+                        -- Transform Llama.cpp response to Ollama format
+                        local ollama_chunk = {
+                            model = "llama-cpp-model",  -- You can customize this
+                            created_at = os.time(),
+                            response = llama_chunk.content or "",
+                            done = llama_chunk.stop or false
+                        }
+                        
+                        -- Send the transformed chunk
+                        ngx.arg[1] = cjson.encode(ollama_chunk) .. "\n"
+                        
+                        -- Remove <think>...</think> blocks if present
+                        if ollama_chunk.response then
+                            local cleaned_response = ngx.re.gsub(
+                                ollama_chunk.response,
+                                [[<think\b[^>]*>[\s\S]*?</think>]],
+                                "",
+                                "ijo"
+                            )
+                            ollama_chunk.response = cleaned_response
+                            ngx.arg[1] = cjson.encode(ollama_chunk) .. "\n"
+                        end
+                    else
+                        ngx.log(ngx.ERR, "Failed to parse Llama.cpp chunk: ", chunk)
+                        ngx.arg[1] = chunk  -- Pass through as-is if parsing fails
+                    end
+                else
+                    ngx.arg[1] = nil  -- Don't send empty chunks
+                end
+                return
+            end
+            
+            -- Final chunk processing
+            if ngx.var.uri == "/api/tags" then
+                -- Transform Llama.cpp models list to Ollama format
+                local success, llama_models = pcall(cjson.decode, ngx.ctx.buffered)
+                if success then
+                    local ollama_models = { models = {} }
+                    
+                    for _, model in ipairs(llama_models.models or {}) do
+                        table.insert(ollama_models.models, {
+                            name = model.id or "unknown",
+                            modified_at = os.time(),
+                            size = 0,  -- We don't have this info from Llama.cpp
+                            digest = "llama-cpp-" .. (model.id or "unknown")
+                        })
+                    end
+                    
+                    ngx.var.resp_body = cjson.encode(ollama_models)
+                    ngx.arg[1] = cjson.encode(ollama_models)
+                else
+                    ngx.log(ngx.ERR, "Failed to parse Llama.cpp models list: ", ngx.ctx.buffered)
+                    ngx.arg[1] = ngx.ctx.buffered  -- Pass through as-is if parsing fails
+                end
+            else
+                -- For non-streaming complete responses
+                local full_response = ngx.ctx.buffered
+                
+                -- Remove all <think>...</think> blocks if present
+                local cleaned_response = ngx.re.gsub(
+                    full_response,
+                    [[<think\b[^>]*>[\s\S]*?</think>]],
+                    "",
+                    "ijo"
+                )
+                
+                ngx.var.resp_body = cleaned_response
+                ngx.arg[1] = cleaned_response
+            end
+        }
+    }
+}
